@@ -3,9 +3,15 @@
 Runs the build check (byte-compile) and the unit test suite, then exercises
 the live HTTP API through the required scenarios:
 
-  1. export keeps following the frozen rules snapshot after rules change
-  2. crash recovery (converge a complete staged artifact; clean up a partial one)
-  3. business-equivalent retransmission (first receipt, no second artifact)
+  1. export keeps following the frozen rules snapshot after rules change:
+     two rule sets masking different fields, same tracks under different ids,
+     each downloaded artifact matches its own records/rules digest/artifact digest
+  2. already-PUBLISHED artifacts poisoned by the legacy input-only masking cache
+     are refused (fail closed), then safely converge to frozen-snapshot content
+     via both the on-demand trigger and automatic periodic worker reconciliation,
+     and re-verified after crash recovery / restart
+  3. crash recovery (converge a complete staged artifact; clean up a partial one)
+  4. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
 
 Exits 0 when everything passes, 1 otherwise.
@@ -93,6 +99,33 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def check_artifact_matches_frozen(export_id, expect_masked):
+    """Download and enforce: HTTP 200, body digest == listed artifact digest,
+    header rules_digest/input_digest == frozen row, and records match expect.
+
+    expect_masked maps the first record's field name -> expected masked value.
+    Returns the parsed artifact document (or None)."""
+    status, detail_raw, _ = req("GET", "/api/exports/" + export_id)
+    detail = as_json(detail_raw) if status == 200 else None
+    status, raw, _ = download(export_id)
+    if detail is None or status != 200:
+        check("download %s -> 200" % export_id, False, "HTTP %s" % status)
+        return None
+    body_digest = hashlib.sha256(raw).hexdigest()
+    doc = as_json(raw)
+    check("%s artifact digest matches listing" % export_id,
+          body_digest == detail["artifact_digest"])
+    check("%s header rules_digest matches frozen row" % export_id,
+          doc.get("rules_digest") == detail["rules_digest"])
+    check("%s header input_digest matches frozen row" % export_id,
+          doc.get("input_digest") == detail["input_digest"])
+    first = doc["records"][0]
+    ok = all(first.get(field) == value for field, value in expect_masked.items())
+    check("%s records follow frozen snapshot (%s)" % (export_id, expect_masked), ok,
+          "got=%s" % {k: first.get(k) for k in expect_masked})
+    return doc
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -136,7 +169,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6 = ("VFY%d-%s" % (i, RUN) for i in range(1, 7))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -215,26 +248,105 @@ def smoke():
     check("E1 evidence untouched after conflicts",
           detail is not None and detail["artifact_digest"] == a1 and detail["stage"] == "PUBLISHED")
 
-    step("规则改动后，E1 仍按冻结快照导出；新导出 E2 使用 R2")
+    step("规则改动后，E1 仍按冻结快照导出；新导出 E2 使用 R2，两份工件各自匹配摘要")
     status, raw, _ = req("POST", "/api/exports", {"export_id": e2, "records": recs})
     check("submit E2 -> 201", status == 201)
     check("E2 froze rules R2", as_json(raw).get("rules_digest") == d2)
     detail2 = wait_for_stage(e2, "PUBLISHED", 90)
     check("E2 published", detail2 is not None and detail2["stage"] == "PUBLISHED")
-    status, raw, _ = download(e2)
-    if status == 200:
-        doc = as_json(raw)
-        check("E2 masked per R2 (lat redacted, depth kept)",
-              doc["records"][0]["lat"] == "***" and doc["records"][0]["depth_m"] == 42.51)
-    else:
-        check("download E2 -> 200", False, "HTTP %s" % status)
-    status, raw, _ = download(e1)
-    check("E1 re-download unchanged after rule change",
-          status == 200 and hashlib.sha256(raw).hexdigest() == a1)
-    if status == 200:
-        doc = as_json(raw)
-        check("E1 still follows frozen R1 (depth redacted, lat kept)",
-              doc["records"][0]["depth_m"] == "***" and doc["records"][0]["lat"] == 31.230416)
+    # Same records, different frozen rules -> each download's record content,
+    # rules summary and artifact summary must match ITS OWN frozen row.
+    doc1 = check_artifact_matches_frozen(e1, {"depth_m": "***", "lat": 31.230416,
+                                              "lon": 121.473701})
+    if doc1:
+        check("E1 vessel hashed under R1", doc1["records"][0]["vessel_id"] != recs[0]["vessel_id"])
+    doc2 = check_artifact_matches_frozen(e2, {"lat": "***", "depth_m": 42.51,
+                                              "vessel_id": recs[0]["vessel_id"]})
+    check("E1/E2 inputs identical but rules + artifacts differ",
+          detail2["input_digest"] == receipt1["input_digest"]
+          and detail2["rules_digest"] == d2 != d1
+          and detail2["artifact_digest"] != a1)
+    check("exactly one published artifact file per export",
+          len(published_files(e1)) == 1 and len(published_files(e2)) == 1)
+
+    step("已发布工件与冻结规则不一致：下载必须 fail-closed（拒绝，不交付错误内容）")
+    # Reproduce the legacy defect on E2: bytes re-masked under R1-style rules
+    # while the export stays PUBLISHED with its frozen R2 digest. A periodic
+    # worker scan may converge it at any time, so (re)poison tightly until a
+    # download is actually observed being refused.
+    injected = None
+    refused_code = None
+    deadline = time.time() + 70
+    while time.time() < deadline:
+        status, raw, _ = req("POST", "/api/test/fault",
+                             {"export_id": e2, "mode": "poison_published", "rules": rules_r1})
+        if status != 200:
+            break
+        injected = as_json(raw).get("injected_digest")
+        code, body, _ = download(e2)
+        if code in (410, 500):
+            refused_code = code
+            break
+        # a worker healed it between the poison and the GET: try again
+        time.sleep(0.2)
+    check("poison E2 published artifact", injected is not None, "never poisoned")
+    check("poisoned PUBLISHED artifact is refused (not 200)", refused_code in (410, 500),
+          "last code=%s" % refused_code)
+    code2, _, _ = download(e1)
+    check("unaffected E1 still downloadable", code2 == 200, "HTTP %s" % code2)
+
+    step("修复部署后受影响的 PUBLISHED 导出安全收敛（on-demand 触发，阶段不倒退）")
+    # Re-arm and trigger in a tight loop: a periodic worker scan may converge
+    # the export first; retry until the on-demand trigger itself reports a heal.
+    triggered = None
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        req("POST", "/api/test/fault",
+            {"export_id": e2, "mode": "poison_published", "rules": rules_r1})
+        status, raw, _ = req("POST", "/api/test/fault", {"export_id": e2, "mode": "reconcile_now"})
+        counts = as_json(raw) if status == 200 else {}
+        if status == 200 and counts.get("healed_published", 0) >= 1:
+            triggered = counts
+            break
+        time.sleep(0.3)
+    check("reconcile_now -> 200 healed>=1", triggered is not None, str(triggered))
+    detail2h = wait_for_stage(e2, "PUBLISHED", 10)
+    check("E2 stayed PUBLISHED (no stage regression)",
+          detail2h is not None and detail2h["stage"] == "PUBLISHED")
+    check("E2 converged off the injected digest",
+          detail2h is not None and detail2h["artifact_digest"] != injected
+          and detail2h["artifact_digest"] == detail2["artifact_digest"])
+    doc2h = check_artifact_matches_frozen(e2, {"lat": "***", "depth_m": 42.51,
+                                               "vessel_id": recs[0]["vessel_id"]})
+    check("E2 reconciliation is idempotent", doc2h is not None)
+    if doc2h:
+        ev_status, ev_raw, _ = req("GET", "/api/exports/" + e2)
+        events = [e["event"] for e in as_json(ev_raw).get("events", [])]
+        check("E2 journal records artifact_reconciled", "artifact_reconciled" in events, str(events))
+
+    step("周期性 worker 和解也能自动收敛受影响的 PUBLISHED 导出（E6）")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201)
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED")
+    good6 = detail6["artifact_digest"] if detail6 else None
+    status, raw, _ = req("POST", "/api/test/fault",
+                         {"export_id": e6, "mode": "poison_published", "rules": rules_r1})
+    check("poison E6 published artifact", status == 200, "HTTP %s" % status)
+    # No on-demand trigger: rely solely on the workers' periodic reconciliation.
+    deadline = time.time() + 120
+    healed6 = None
+    while time.time() < deadline:
+        d = wait_for_stage(e6, "PUBLISHED", 1)
+        if d and d["artifact_digest"] == good6:
+            healed6 = d
+            break
+        time.sleep(1)
+    check("E6 auto-healed by periodic worker reconciliation", healed6 is not None)
+    if healed6:
+        check("E6 stage never regressed", healed6["stage"] == "PUBLISHED")
+        check_artifact_matches_frozen(e6, {"lat": "***", "depth_m": 42.51,
+                                           "vessel_id": recs[0]["vessel_id"]})
 
     step("崩溃恢复 A：暂存完整工件后进程退出 → 收敛到同一完整工件")
     status, raw, _ = req("POST", "/api/test/fault", {"export_id": e3, "mode": "crash_after_staged"})
@@ -306,9 +418,20 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    step("崩溃/重启与暂存恢复之后：再次核对 E1/E2/E6 与各自冻结规则一致")
+    # The crash-injection scenarios above exited worker processes; the
+    # supervisor (compose restart / smoke restart loop) brought them back and
+    # startup reconciliation + staged recovery have both run since.
+    for eid, expect in (
+        (e1, {"depth_m": "***", "lat": 31.230416}),
+        (e2, {"lat": "***", "depth_m": 42.51}),
+        (e6, {"lat": "***", "depth_m": 42.51}),
+    ):
+        check_artifact_matches_frozen(eid, expect)
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 

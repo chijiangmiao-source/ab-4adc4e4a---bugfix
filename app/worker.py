@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 
-from . import artifacts, config, recovery, store
+from . import artifacts, config, reconcile, recovery, store
 from .render import render_artifact_bytes
 
 
@@ -32,6 +32,13 @@ def _crash(me, export_id, mode):
 
 
 def process_export(conn, export_id, me, fencing):
+    pre = store.get_export(conn, export_id)
+    if pre is not None and pre["stage"] == "RECEIVED":
+        # Defense in depth: never render/publish a row whose stored masking
+        # disagrees with its own frozen rules snapshot. Correct in place (stage
+        # stays RECEIVED) and let a later tick publish the consistent bytes.
+        if reconcile.heal_unfinished(conn, pre, me):
+            return "masking_corrected"
     with store.immediate(conn):
         if not store.cas_stage(conn, export_id, "PROCESSING", ("RECEIVED",)):
             return "skipped"
@@ -116,10 +123,21 @@ def run_forever(me=None):
     conn = store.connect()
     store.init_db(conn)
     recovery.sweep_orphans(conn, me)
+    # Converge any export poisoned by the legacy input-only masking cache
+    # (PUBLISHED healed in place; unfinished corrected and reprocessed).
+    counts = reconcile.reconcile_all(conn, me)
+    if counts["healed_published"] or counts["corrected_unfinished"]:
+        print("[%s] startup reconciliation: %s" % (me, counts), flush=True)
+    last_reconcile = time.time()
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
     while True:
         try:
             tick(conn, me)
+            # Periodic reconciliation so affected rows converge even when the
+            # deployment is long-lived and the export set changes at runtime.
+            if time.time() - last_reconcile > config.reconcile_interval():
+                reconcile.reconcile_all(conn, me)
+                last_reconcile = time.time()
         except Exception as exc:  # keep the loop alive; next tick retries
             print("[%s] tick error: %r" % (me, exc), file=sys.stderr, flush=True)
             try:

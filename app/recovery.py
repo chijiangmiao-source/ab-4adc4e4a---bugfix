@@ -13,7 +13,7 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
 import hashlib
 import os
 
-from . import artifacts, store
+from . import artifacts, reconcile, store
 from .render import render_artifact_bytes
 
 
@@ -33,6 +33,11 @@ def recover_export(conn, export_id, actor):
     export = store.get_export(conn, export_id)
     if not export or export["stage"] == "PUBLISHED":
         return "none"
+    # Never converge/recompute from stored masking that disagrees with the
+    # frozen rules snapshot (legacy cache poisoning): correct and reprocess.
+    if artifacts.expected_masked_records(export) != export.get("masked_records"):
+        reconcile.heal_unfinished(conn, export, actor)
+        return "masking_corrected"
     _, expected_digest = _expected(export)
     pub = artifacts.published_path(export_id)
 

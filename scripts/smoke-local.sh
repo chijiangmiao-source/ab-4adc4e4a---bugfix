@@ -13,9 +13,11 @@ APP_PID=$!
 
 # restart loop mimics compose `restart: on-failure` for crash-injection scenarios
 DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 \
+  RECONCILE_INTERVAL_SECONDS=3 \
   sh -c 'while true; do python3 -m app.worker; sleep 1; done' &
 W1_PID=$!
 DATA_DIR="$DATA" TEST_HOOKS=1 LEASE_TTL_SECONDS=8 POLL_INTERVAL_SECONDS=0.3 \
+  RECONCILE_INTERVAL_SECONDS=3 \
   sh -c 'while true; do python3 -m app.worker; sleep 1; done' &
 W2_PID=$!
 

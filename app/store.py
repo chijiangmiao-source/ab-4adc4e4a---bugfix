@@ -81,6 +81,9 @@ DEFAULT_RULES = {"rules": [{"field": "vessel_id", "action": "hash", "length": 12
 
 FAULT_MODES = ("crash_partial_write", "crash_after_staged")
 
+# Test-only administrative fault actions (synchronous, not armed for a worker).
+FAULT_ACTIONS = ("poison_published", "reconcile_now")
+
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -182,17 +185,14 @@ def submit_export(conn, export_id, records_obj, actor="api"):
         # whole adjudication, never in the middle of it.
         rules = get_rules(conn)
         decision_hash = digest_of(input_digest + ":" + rules["digest"])
-        cached_mask = conn.execute(
-            "SELECT masked_records FROM exports WHERE input_digest = ? "
-            "ORDER BY created_at LIMIT 1",
-            (input_digest,),
-        ).fetchone()
-        if cached_mask:
-            masked_records = cached_mask["masked_records"]
-        else:
-            masked_records = canonical(apply_rules(
-                json.loads(records_canon), json.loads(rules["body"])
-            ))
+        # The masked output is derived solely from THIS export's frozen records
+        # and frozen rules snapshot. It must never be borrowed from another row
+        # (a cache keyed by input alone produced the legacy cross-rules defect;
+        # even keying by input+rules could inherit masking from a stale row), so
+        # it is recomputed deterministically on every adjudication.
+        masked_records = canonical(apply_rules(
+            json.loads(records_canon), json.loads(rules["body"])
+        ))
         cur = conn.execute(
             """INSERT INTO exports(export_id, decision_hash, input_digest, rules_digest,
                    rules_version, records, rules_snapshot, receipt_id, received_at,
@@ -248,6 +248,42 @@ def list_exports(conn, limit=200):
         "SELECT * FROM exports ORDER BY created_at DESC, export_id DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def all_exports(conn):
+    """Every frozen export, oldest first (startup reconciliation order)."""
+    rows = conn.execute(
+        "SELECT * FROM exports ORDER BY created_at ASC, export_id ASC"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def correct_frozen_masking(conn, export_id, masked_records, actor, reason):
+    """Repair an unfinished export whose stored masked records do not follow
+    its own frozen rules snapshot. The frozen evidence (records + rules
+    snapshot + digests + receipt) never changes; only the derived masking output
+    is corrected, and PROCESSING/STAGED rows are reset to RECEIVED so a worker
+    republishes a consistent artifact (RECEIVED stays put). Returns True when a
+    correction was made. PUBLISHED exports are healed separately, in place."""
+    with immediate(conn):
+        row = conn.execute(
+            "SELECT stage FROM exports WHERE export_id = ?", (export_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE exports SET masked_records = ?, updated_at = ? WHERE export_id = ?",
+            (masked_records, utcnow(), export_id),
+        )
+        journal(conn, export_id, actor, "masking_corrected", reason)
+        if row["stage"] in ("PROCESSING", "STAGED"):
+            conn.execute(
+                "UPDATE exports SET stage = 'RECEIVED', attempts = attempts + 1 "
+                "WHERE export_id = ? AND stage IN ('PROCESSING','STAGED')",
+                (export_id,),
+            )
+            journal(conn, export_id, actor, "requeued", reason)
+    return True
 
 
 def export_events(conn, export_id, limit=50):

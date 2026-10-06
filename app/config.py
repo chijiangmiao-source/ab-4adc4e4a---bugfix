@@ -38,6 +38,11 @@ def poll_interval():
     return float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
 
 
+def reconcile_interval():
+    """Period between scans that converge legacy-inconsistent exports."""
+    return float(os.environ.get("RECONCILE_INTERVAL_SECONDS", "30"))
+
+
 def test_hooks():
     """Fault-injection endpoints are only available when explicitly enabled."""
     return os.environ.get("TEST_HOOKS", "") == "1"

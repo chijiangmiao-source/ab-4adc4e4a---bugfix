@@ -17,7 +17,8 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import artifacts, config, masking, store
+from . import artifacts, config, masking, reconcile, store
+from . import testsupport
 
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
@@ -212,9 +213,9 @@ class Handler(BaseHTTPRequestHandler):
         except artifacts.ArtifactMissing:
             self._send_error_json(410, "artifact_missing", "published artifact file is gone")
             return
-        except artifacts.DigestMismatch:
+        except (artifacts.DigestMismatch, artifacts.FrozenSnapshotMismatch):
             self._send_error_json(500, "artifact_unverified",
-                                  "artifact failed digest verification; refusing to serve")
+                                  "artifact failed frozen-snapshot verification; refusing to serve")
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -257,9 +258,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             export_id = doc.get("export_id")
             mode = doc.get("mode")
-            if not isinstance(export_id, str) or mode not in store.FAULT_MODES:
+            if not isinstance(export_id, str):
+                raise ApiError(422, "invalid_fault", "need export_id")
+            # Synchronous administrative test actions.
+            if mode in store.FAULT_ACTIONS:
+                conn = store.connect()
+                try:
+                    if mode == "reconcile_now":
+                        counts = reconcile.reconcile_all(conn, "test-hook")
+                        self._send_json(200, {"ok": True, "mode": mode, **counts})
+                        return
+                    wrong_rules = doc.get("rules")
+                    if not isinstance(wrong_rules, dict):
+                        raise ApiError(422, "invalid_fault",
+                                       "poison_published needs a rules document")
+                    injected = testsupport.poison_published(conn, export_id, wrong_rules)
+                finally:
+                    conn.close()
+                if injected is None:
+                    self._send_error_json(
+                        409, "fault_unavailable",
+                        "export must be PUBLISHED and rules must validate")
+                    return
+                self._send_json(200, {"ok": True, "export_id": export_id,
+                                      "mode": mode, "injected_digest": injected})
+                return
+            if mode not in store.FAULT_MODES:
                 raise ApiError(422, "invalid_fault",
-                               "need export_id and mode in %s" % "/".join(store.FAULT_MODES))
+                               "need mode in %s/%s"
+                               % ("/".join(store.FAULT_MODES), "/".join(store.FAULT_ACTIONS)))
             conn = store.connect()
             try:
                 store.set_fault(conn, export_id, mode)
@@ -275,6 +302,9 @@ def main():
     conn = store.connect()
     try:
         store.init_db(conn)
+        # Converge exports poisoned by the legacy input-only masking cache even
+        # before workers attach (idempotent; safe to run concurrently with them).
+        reconcile.reconcile_all(conn, "api-startup")
     finally:
         conn.close()
     server = ThreadingHTTPServer(("0.0.0.0", config.port()), Handler)

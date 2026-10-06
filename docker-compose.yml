@@ -27,6 +27,7 @@ services:
       TEST_HOOKS: "1"
       LEASE_TTL_SECONDS: "8"
       POLL_INTERVAL_SECONDS: "0.5"
+      RECONCILE_INTERVAL_SECONDS: "3"   # legacy-inconsistent exports converge quickly
     volumes:
       - data:/data
     restart: on-failure        # crashed workers restart and run recovery

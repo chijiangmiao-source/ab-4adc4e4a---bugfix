@@ -21,6 +21,15 @@
 
 - **同一持久化裁决**：`POST /api/exports` 在单个 `IMMEDIATE` 事务中读取当前规则并
   冻结「规范化输入 + 规则快照 + 决策摘要 + 日志」。此后改动当前规则不影响该标识的导出。
+  遮蔽结果**只由该导出自身冻结的记录与规则快照确定性推导**，绝不借用其他导出行
+  （历史上按输入摘要复用遮蔽的缺陷会让新规则下的导出携带旧规则的遮蔽，已移除）。
+- **冻结快照一致性自愈（reconcile）**：app 与每个 worker 启动时、worker 运行期每
+  `RECONCILE_INTERVAL_SECONDS` 扫描全部导出。工件内容（记录遮蔽结果）与冻结快照不符时：
+  已 `PUBLISHED` 的导出**原地**重算、把旧工件硬链接进 quarantine、原子替换并改写工件
+  指针——阶段永不离开 `PUBLISHED`（不倒退、不产生第二个工件）；未完成的导出纠正派生
+  遮蔽、作废旧暂存并回到 `RECEIVED` 由正常单次发布管线重新生成。冻结证据（记录、规则
+  快照、各摘要、回执）始终不变。下载端再做一次 fail-closed 校验，任何与冻结快照不符的
+  已发布工件都拒绝投递（HTTP 500），绝不交付错误内容。
 - **幂等与冲突**：同一标识的业务等价重传（键序/空白/整型浮点/Unicode 组合差异）返回
   首次回执（HTTP 200，`replay: true`），不产生第二个工件；记录或规则快照不同则返回
   HTTP 409 并保留原有证据（原裁决行不被修改，冲突尝试记入日志）。
@@ -54,13 +63,18 @@ docker compose down -v                                   # 重置全部状态
 ## verify 验收内容（执行后退出，退出码即结果）
 
 1. **构建检查**：`python -m compileall app verify tests`
-2. **代码测试**：`python -m unittest discover -s tests`（48 个用例：规范化、遮蔽、
-   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态）
+2. **代码测试**：`python -m unittest discover -s tests`（56 个用例：规范化、遮蔽、
+   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态、
+   冻结快照一致性自愈与下载 fail-closed）
 3. **API/HTTP 冒烟**：
-   - 规则改动后，已冻结导出仍按冻结快照导出（E1 用 R1、E2 用 R2，互不影响）
+   - 两套遮蔽不同字段的规则（R1: depth_m 遮蔽 / vessel_id 散列；R2: lat 遮蔽），相同
+     航迹用不同标识提交：两份下载工件的记录内容、规则摘要、工件摘要**各自**匹配其冻结行
+   - 已 `PUBLISHED` 但内容与冻结规则不符的工件：下载 fail-closed 拒绝；on-demand 触发与
+     worker 周期和解都将其安全收敛为符合冻结快照的可下载版本（阶段不倒退、旧件留证），
+     恢复/重启后再次核对仍一致
    - 崩溃恢复：暂存完整后崩溃 → 收敛到同一完整工件；写一半崩溃 → 清理残缺并重处理
    - 业务等价重传 → 首次回执且无第二个工件；记录/规则快照不同 → 409 且证据保留
-   - 下载接口在崩溃窗口内只返回 409，绝不暴露未核验内容
+   - 下载接口在崩溃窗口内只返回 409，绝不暴露未核验内容；健康响应、操作页真实 API 轮询
 
 ## 本地开发（无 Docker）
 
@@ -79,7 +93,7 @@ python3 -m unittest discover -s tests -t .     # 单元测试
 | GET | `/api/exports` | 列表：阶段、冻结规则摘要、输入摘要、工件摘要 |
 | GET | `/api/exports/{id}` | 详情 + 处理日志 + 当前租约 |
 | GET | `/api/exports/{id}/artifact` | 下载已发布工件（摘要核验，否则 409/410/500） |
-| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` |
+| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged`（武装给 worker），`reconcile_now`（立即和解）/ `poison_published`（复现历史遮蔽错配，验收用） |
 
 ## 配置（环境变量）
 
@@ -90,6 +104,7 @@ python3 -m unittest discover -s tests -t .     # 单元测试
 | `DATA_DIR` | `./data` | SQLite 与工件根目录 |
 | `LEASE_TTL_SECONDS` | `10` | 租约时长（崩溃接管延迟的上界） |
 | `POLL_INTERVAL_SECONDS` | `0.5` | worker 轮询间隔 |
+| `RECONCILE_INTERVAL_SECONDS` | `30` | 冻结快照一致性扫描间隔（受影响导出的收敛上界） |
 | `TEST_HOOKS` | 关 | 置 `1` 开启故障注入端点（验收用，生产应关闭） |
 
 ## 遮蔽规则示例

@@ -85,6 +85,10 @@ def process_export(conn, export_id, me, fencing):
 
 def tick(conn, me):
     did_work = False
+    # Repair any drift between frozen decisions and stored masks/artifacts
+    # first, so recovery and processing below only ever see consistent rows.
+    if recovery.scan_consistency(conn, me):
+        did_work = True
     # Recover exports whose owner vanished (lease expired or absent).
     for row in store.stuck_exports(conn):
         export_id = row["export_id"]
@@ -116,6 +120,7 @@ def run_forever(me=None):
     conn = store.connect()
     store.init_db(conn)
     recovery.sweep_orphans(conn, me)
+    recovery.scan_consistency(conn, me)
     print("[%s] worker started (poll=%.2fs lease_ttl=%.1fs)" % (me, config.poll_interval(), config.lease_ttl()), flush=True)
     while True:
         try:

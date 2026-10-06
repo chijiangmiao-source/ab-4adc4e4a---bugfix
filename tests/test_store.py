@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -74,6 +75,26 @@ class DecisionTest(StoreTestBase):
         self.assertEqual(receipt["rules_version"], 2)
         row = store.get_export(self.conn, "E-1")
         self.assertEqual(row["rules_version"], 1)  # E-1 stays frozen on v1
+
+    def test_same_records_under_different_rules_freeze_their_own_mask(self):
+        """Two exports with identical records but different frozen rules
+        snapshots must each derive their mask from their own snapshot."""
+        records = [{"vessel_id": "V-1", "depth_m": 10, "lat": 31.2}]
+        self.submit("E-1", records)  # freezes default rules (hash vessel_id)
+        store.set_rules(self.conn, {"rules": [{"field": "depth_m", "action": "redact"}]})
+        status, _ = self.submit("E-2", records)
+        self.assertEqual(201, status)
+        e1 = store.get_export(self.conn, "E-1")
+        e2 = store.get_export(self.conn, "E-2")
+        self.assertNotEqual(e1["rules_digest"], e2["rules_digest"])
+        masked1 = json.loads(e1["masked_records"])
+        masked2 = json.loads(e2["masked_records"])
+        # E-1 follows its own snapshot: depth kept, vessel hashed.
+        self.assertEqual(10, masked1[0]["depth_m"])
+        self.assertNotEqual("V-1", masked1[0]["vessel_id"])
+        # E-2 follows its own snapshot: depth redacted, vessel kept.
+        self.assertEqual("***", masked2[0]["depth_m"])
+        self.assertEqual("V-1", masked2[0]["vessel_id"])
 
 
 class StageTest(StoreTestBase):

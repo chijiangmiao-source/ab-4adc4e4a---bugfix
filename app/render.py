@@ -7,8 +7,20 @@ recompute the expected digest and converge to the very same artifact.
 import json
 
 from .canonical import canonical
+from .masking import apply_rules
 
 GENERATOR = "track-export/1.0"
+
+
+def expected_masked_records(export_row):
+    """Mask the frozen records with the frozen rules snapshot.
+
+    This is the only legitimate source of an export's masked content; anything
+    stored that disagrees is drift and must be repaired.
+    """
+    records = json.loads(export_row["records"])
+    rules_doc = json.loads(export_row["rules_snapshot"])
+    return canonical(apply_rules(records, rules_doc))
 
 
 def render_artifact_bytes(export_row):

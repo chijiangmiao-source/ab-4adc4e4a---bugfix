@@ -13,6 +13,7 @@ Exits 0 when everything passes, 1 otherwise.
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -23,6 +24,13 @@ import uuid
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from app.canonical import canonical  # noqa: E402
+from app.masking import apply_rules  # noqa: E402
+from app.render import render_artifact_bytes  # noqa: E402
+
 RUN = uuid.uuid4().hex[:6]
 
 FAILURES = []
@@ -93,6 +101,30 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def download_doc(export_id):
+    """(status, raw, parsed_doc_or_None) — never raises on a bad body."""
+    status, raw, _ = download(export_id)
+    if status != 200:
+        return status, raw, None
+    try:
+        return status, raw, as_json(raw)
+    except Exception:
+        return status, raw, None
+
+
+def expected_artifact_digest(detail, records, rules_doc):
+    """Digest of the artifact the frozen decision must deterministically produce."""
+    row = {
+        "export_id": detail["export_id"],
+        "received_at": detail["received_at"],
+        "input_digest": detail["input_digest"],
+        "rules_digest": detail["rules_digest"],
+        "rules_version": detail["rules_version"],
+        "masked_records": canonical(apply_rules(json.loads(canonical(records)), rules_doc)),
+    }
+    return hashlib.sha256(render_artifact_bytes(row)).hexdigest()
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -136,7 +168,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6 = ("VFY%d-%s" % (i, RUN) for i in range(1, 7))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -306,9 +338,103 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    step("遗留污染修复：被旧缓存缺陷污染的 PUBLISHED 导出安全收敛为符合其冻结规则")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201, "HTTP %s %s" % (status, raw[:300]))
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED")
+    expected6 = expected_artifact_digest(detail6, recs, rules_r2) if detail6 else None
+    check("E6 artifact matches its frozen R2 before fault injection",
+          expected6 is not None and detail6["artifact_digest"] == expected6)
+    if detail6:
+        # Simulate the exact state the legacy input-keyed mask cache persisted:
+        # frozen mask + published artifact computed from R1 while the export
+        # is frozen on R2. Written directly into the shared data dir, as a
+        # pre-fix deployment would have left it on disk.
+        legacy_mask = canonical(apply_rules(json.loads(canonical(recs)), rules_r1))
+        legacy_bytes = render_artifact_bytes({
+            "export_id": e6,
+            "received_at": detail6["received_at"],
+            "input_digest": detail6["input_digest"],
+            "rules_digest": detail6["rules_digest"],
+            "rules_version": detail6["rules_version"],
+            "masked_records": legacy_mask,
+        })
+        legacy_digest = hashlib.sha256(legacy_bytes).hexdigest()
+        db = sqlite3.connect(os.path.join(DATA_DIR, "app.db"), timeout=15)
+        try:
+            db.execute(
+                "UPDATE exports SET masked_records = ?, artifact_digest = ? WHERE export_id = ?",
+                (legacy_mask, legacy_digest, e6),
+            )
+            db.execute(
+                "UPDATE artifacts SET digest = ? WHERE export_id = ? AND kind = 'published'",
+                (legacy_digest, e6),
+            )
+            db.commit()
+        finally:
+            db.close()
+        pub6 = os.path.join(DATA_DIR, "artifacts", "published", e6 + ".json")
+        staging = pub6 + ".verify-tmp"
+        with open(staging, "wb") as fh:
+            fh.write(legacy_bytes)
+        os.replace(staging, pub6)
+
+        repaired = None
+        never_regressed = True
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            status, raw, _ = req("GET", "/api/exports/" + e6)
+            if status == 200:
+                probe = as_json(raw)
+                if probe["stage"] != "PUBLISHED":
+                    never_regressed = False
+                if probe["artifact_digest"] == expected6:
+                    repaired = probe
+                    break
+            time.sleep(0.5)
+        check("legacy-polluted PUBLISHED export converges to frozen R2", repaired is not None)
+        check("PUBLISHED stage never regressed during repair", never_regressed)
+        if repaired:
+            events = [e["event"] for e in repaired.get("events", [])]
+            check("repair journaled (mask_corrected/artifact_republished)",
+                  "mask_corrected" in events and "artifact_republished" in events,
+                  "events=%s" % events)
+            status, raw, doc = download_doc(e6)
+            check("repaired E6 download verified", status == 200
+                  and hashlib.sha256(raw).hexdigest() == expected6)
+            check("repaired E6 records follow frozen R2 (lat redacted, depth kept)",
+                  doc is not None
+                  and doc["records"][0]["lat"] == "***"
+                  and doc["records"][0]["depth_m"] == 42.51)
+            check("repaired E6 carries frozen R2 digest", doc is not None and doc["rules_digest"] == d2)
+            check("exactly one published artifact file for E6",
+                  len(published_files(e6)) == 1, str(published_files(e6)))
+
+    step("恢复/修复演练后复核：E1、E2、E6 仍各自符合其冻结规则快照")
+    status, raw, doc = download_doc(e1)
+    check("E1 still matches frozen R1", status == 200
+          and hashlib.sha256(raw).hexdigest() == a1
+          and doc is not None
+          and doc["records"][0]["depth_m"] == "***"
+          and doc["records"][0]["lat"] == 31.230416
+          and doc["rules_digest"] == d1)
+    status, raw, doc = download_doc(e2)
+    check("E2 still matches frozen R2", status == 200
+          and hashlib.sha256(raw).hexdigest() == detail2["artifact_digest"]
+          and doc is not None
+          and doc["records"][0]["lat"] == "***"
+          and doc["records"][0]["depth_m"] == 42.51
+          and doc["rules_digest"] == d2)
+    status, raw, doc = download_doc(e6)
+    check("E6 still matches frozen R2 after repair", status == 200
+          and hashlib.sha256(raw).hexdigest() == expected6
+          and doc is not None
+          and doc["records"][0]["lat"] == "***")
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 

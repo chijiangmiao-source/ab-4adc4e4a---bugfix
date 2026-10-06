@@ -182,17 +182,13 @@ def submit_export(conn, export_id, records_obj, actor="api"):
         # whole adjudication, never in the middle of it.
         rules = get_rules(conn)
         decision_hash = digest_of(input_digest + ":" + rules["digest"])
-        cached_mask = conn.execute(
-            "SELECT masked_records FROM exports WHERE input_digest = ? "
-            "ORDER BY created_at LIMIT 1",
-            (input_digest,),
-        ).fetchone()
-        if cached_mask:
-            masked_records = cached_mask["masked_records"]
-        else:
-            masked_records = canonical(apply_rules(
-                json.loads(records_canon), json.loads(rules["body"])
-            ))
+        # The export's content is derived only from its own frozen records and
+        # rules snapshot. Reusing another export's mask (e.g. cached by input
+        # digest alone) would leak a different rules snapshot's masking into
+        # this export's artifact.
+        masked_records = canonical(apply_rules(
+            json.loads(records_canon), json.loads(rules["body"])
+        ))
         cur = conn.execute(
             """INSERT INTO exports(export_id, decision_hash, input_digest, rules_digest,
                    rules_version, records, rules_snapshot, receipt_id, received_at,
@@ -373,6 +369,51 @@ def published_artifacts(conn, export_id):
 
 def abort_artifact(conn, artifact_id):
     conn.execute("UPDATE artifacts SET kind = 'aborted' WHERE id = ? AND kind = 'staged'", (artifact_id,))
+
+
+# ---------------------------------------------------------------- consistency repair
+
+def correct_masked_records(conn, export_id, expected_masked, previous_masked, actor):
+    """Realign a drifted frozen mask with the export's own frozen records and
+    rules snapshot (CAS on the drifted value, so racing repairs cannot
+    clobber each other). Evidence columns and the stage are untouched."""
+    cur = conn.execute(
+        "UPDATE exports SET masked_records = ?, updated_at = ? "
+        "WHERE export_id = ? AND masked_records = ?",
+        (expected_masked, utcnow(), export_id, previous_masked),
+    )
+    if cur.rowcount != 1:
+        return False
+    journal(conn, export_id, actor, "mask_corrected",
+            "masked_records realigned with the frozen records+rules snapshot")
+    return True
+
+
+def repair_published_artifact(conn, export_id, digest, path, actor, via):
+    """Point a PUBLISHED export at the corrected artifact.
+
+    PUBLISHED is terminal: the stage is never touched. Only the artifact
+    reference (digest/path) and the artifact registry move, in the caller's
+    transaction.
+    """
+    cur = conn.execute(
+        "UPDATE exports SET artifact_digest = ?, artifact_path = ?, updated_at = ? "
+        "WHERE export_id = ? AND stage = 'PUBLISHED'",
+        (digest, path, utcnow(), export_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    updated = conn.execute(
+        "UPDATE artifacts SET path = ?, digest = ? WHERE export_id = ? AND kind = 'published'",
+        (path, digest, export_id),
+    ).rowcount
+    if updated == 0:
+        conn.execute(
+            "INSERT INTO artifacts(export_id, kind, path, digest, created_at) VALUES (?,?,?,?,?)",
+            (export_id, "published", path, digest, utcnow()),
+        )
+    journal(conn, export_id, actor, "artifact_republished", "digest=%s via=%s" % (digest, via))
+    return True
 
 
 # ---------------------------------------------------------------- work queues

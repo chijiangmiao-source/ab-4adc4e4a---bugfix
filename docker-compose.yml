@@ -45,7 +45,7 @@ services:
       API_BASE: "http://app:8080"
       DATA_DIR: /data
     volumes:
-      - data:/data:ro
+      - data:/data        # rw: also simulates a legacy-polluted published export
     restart: "no"              # one-shot: runs the acceptance suite and exits
 
 volumes:
